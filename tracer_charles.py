@@ -288,8 +288,6 @@ def optimize_class_parameters(classes, training_dir, num_templates_per_class=5):
         }
     return optimized_parameters
 
-filter_change_files=[]
-
 def classify_trace(spectrogram, templates, filename=""):
     best_distance = float('inf')
     best_distance_nonfiltered = float('inf')
@@ -335,11 +333,7 @@ def classify_trace(spectrogram, templates, filename=""):
             )
             if distance < best_distance_nonfiltered:
                 best_distance_nonfiltered = distance
-                best_label_nonfiltered = label
-        
-        if best_label != best_label_nonfiltered:
-            filter_change_files.append(filename)
-            
+                best_label_nonfiltered = label           
                 
         # Experimental based on histogram.
         # Seems like when we mispredict as DEN, on avg the distance to ROP is >= 600, and if we predict DEN correctly it is < 600
@@ -350,7 +344,7 @@ def classify_trace(spectrogram, templates, filename=""):
     
 
             
-    return best_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label
+    return best_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label, best_label_nonfiltered, trace_result_nonfiltered
 
 def gaussian_kernel(size: int, sigma: float) -> np.ndarray:
     """
@@ -414,6 +408,55 @@ def display_spectrogram_with_array(original_spectrogram: np.ndarray, modified_sp
     ax3 = axes[2]
     ax3.plot(array, label=array_title, color='orange')
     ax3.set_title(array_title)
+    ax3.set_xlabel('Index')
+    ax3.set_ylabel('Value')
+    ax3.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+    
+def display_spectrogram_with_array_filtered(original_spectrogram: np.ndarray, modified_spectrogram: np.ndarray, array: np.ndarray, array_filtered: np.ndarray,
+                                   spectrogram_title: str = "Spectrogram", 
+                                   array_title: str = "1D Array", array_title_filtered: str = "1D Array Filtered"):
+    """
+    Displays a 2D numpy array (spectrogram) side by side with a 1D numpy array.
+
+    Args:
+        spectrogram (np.ndarray): 2D array representing the spectrogram.
+        array (np.ndarray): 1D array to display alongside the spectrogram.
+        spectrogram_title (str): Title for the spectrogram plot.
+        array_title (str): Title for the 1D array plot.
+    """
+    fig, axes = plt.subplots(1, 4, figsize=(12, 6), gridspec_kw={'width_ratios': [3, 3, 3, 3]})
+    
+    # Plot the spectrogram
+    ax1 = axes[0]
+    im = ax1.imshow(original_spectrogram, aspect='auto', origin='lower', cmap='viridis')
+    ax1.set_title(spectrogram_title)
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('Frequency')
+    plt.colorbar(im, ax=ax1, orientation='vertical', label='Intensity')
+    
+    # Plot the spectrogram
+    ax2 = axes[1]
+    im = ax2.imshow(modified_spectrogram, aspect='auto', origin='lower', cmap='viridis')
+    ax2.set_title(spectrogram_title)
+    ax2.set_xlabel('Time')
+    ax2.set_ylabel('Frequency')
+    plt.colorbar(im, ax=ax2, orientation='vertical', label='Intensity')
+    
+    # Plot the 1D array horizontally
+    ax3 = axes[2]
+    ax3.plot(array, label=array_title, color='orange')
+    ax3.set_title(array_title)
+    ax3.set_xlabel('Index')
+    ax3.set_ylabel('Value')
+    ax3.grid(True)
+    
+    # Plot the 1D array horizontally
+    ax3 = axes[3]
+    ax3.plot(array_filtered, label=array_title, color='orange')
+    ax3.set_title("Filtered " + array_title_filtered)
     ax3.set_xlabel('Index')
     ax3.set_ylabel('Value')
     ax3.grid(True)
@@ -520,13 +563,15 @@ if __name__ == "__main__":
             if spectrogram is None:
                 print(f"Skipping file {filename} due to invalid spectrogram.")
                 continue
-            predicted_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label = classify_trace(spectrogram, templates, filename)
+            predicted_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label, predicted_label_nonfiltered, trace_result_nonfiltered = classify_trace(spectrogram, templates, filename)
             y_true.append(cls)
             y_pred.append(predicted_label)
             
-            if cls != predicted_label and filename in filter_change_files:
-                print(i, filename, f"predicted: {predicted_label}, actual: {cls}, distance: {best_distance}")
-                display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
+            if cls != predicted_label and predicted_label != predicted_label_nonfiltered:
+                #print(i, filename, f"predicted: {predicted_label}, actual: {cls}, distance: {best_distance}")
+                print(i, filename, f"predicted: {predicted_label}, nonfiltered_predicted: {predicted_label_nonfiltered}, actual: {cls}, distance: {best_distance}")
+                #display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
+                display_spectrogram_with_array_filtered(original_spectrogram, modified_spectrogram, trace_result_nonfiltered, trace_result, cls, predicted_label_nonfiltered, predicted_label)
                 
             if predicted_label == 'DEN':
                 if cls != predicted_label:
