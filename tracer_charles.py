@@ -13,6 +13,7 @@ from skimage import feature
 from scipy.ndimage import binary_dilation, binary_erosion, binary_closing, binary_fill_holes, binary_opening
 from collections import defaultdict
 from statistics import median, mean
+from scipy.ndimage import label as scipy_label, find_objects
 
 SAMPLE_RATE = 192000
 FRAME_TIME_LENGTH = 2  # seconds
@@ -103,7 +104,7 @@ def get_spectrogram(filename):
         print(f"Error processing file {filename}: {e}")
         return None, None, None
 
-def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_delta=2, pcen_r=0.5, kernel_size=3, window_size = 3, sigma = 3, high_threshold=0.5, low_threshold=0.2):
+def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_delta=2, pcen_r=0.5, kernel_size=3, window_size = 3, sigma = 3, high_threshold=0.5, low_threshold=0.2, filter = False):
     trace = [0]
     power_threshold = np.percentile(spectrogram.flatten(), 90)
     spectrogram[spectrogram < power_threshold] = 0
@@ -133,6 +134,13 @@ def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_d
     modified_spectrogram = feature.canny(modified_spectrogram, sigma=sigma, high_threshold=high_threshold, low_threshold=low_threshold)
     modified_spectrogram = binary_closing(input=modified_spectrogram, structure=structure)
 
+    if filter:
+        filtered_spectrogram = filter_large_components(modified_spectrogram, 5)
+        nonfiltered_spectrogram = modified_spectrogram
+        modified_spectrogram = filtered_spectrogram
+    else:
+        nonfiltered_spectrogram = spectrogram
+    
     #modified_spectrogram = spectrogram * local_density
     window_size=21
     #trace = trace_orig(spectrogram=modified_spectrogram.astype(float), comparison_range=5)
@@ -144,7 +152,7 @@ def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_d
     #trace = medfilt(trace, window_size)
 
     trace = np.convolve(trace, np.ones(5)/5, mode='valid')
-    return trace, modified_spectrogram, spectrogram
+    return trace, modified_spectrogram, nonfiltered_spectrogram
 
 def apply_pcen(spectrogram, alpha=0.98, delta=2.0, r=0.5, eps=1e-6):
     pcen = librosa.pcen(spectrogram, sr=192000)
@@ -280,9 +288,13 @@ def optimize_class_parameters(classes, training_dir, num_templates_per_class=5):
         }
     return optimized_parameters
 
-def classify_trace(spectrogram, templates):
+filter_change_files=[]
+
+def classify_trace(spectrogram, templates, filename=""):
     best_distance = float('inf')
+    best_distance_nonfiltered = float('inf')
     best_label = 'NULL'
+    best_label_nonfiltered = 'NULL'
     
     best_distance_per_label = defaultdict(lambda: float('inf'))
     
@@ -299,7 +311,8 @@ def classify_trace(spectrogram, templates):
         low_threshold = params['low_threshold']
         high_threshold = params['high_threshold']
         #trace_result, modified_spectrogram = trace(spectrogram, power_threshold, comparison_range, pcen_alpha, pcen_delta, pcen_r)
-        trace_result, modified_spectrogram, original_spectrogram = trace(spectrogram, power_threshold, comparison_range, window_size=window_size, sigma=sigma, low_threshold=low_threshold, high_threshold=high_threshold)
+        trace_result_nonfiltered, modified_spectrogram, original_spectrogram = trace(spectrogram, power_threshold, comparison_range, window_size=window_size, sigma=sigma, low_threshold=low_threshold, high_threshold=high_threshold, filter=False)
+        trace_result, modified_spectrogram, original_spectrogram = trace(spectrogram, power_threshold, comparison_range, window_size=window_size, sigma=sigma, low_threshold=low_threshold, high_threshold=high_threshold, filter=True)
 
         for template in class_templates:
             distance, _, _, _ = accelerated_dtw(
@@ -310,12 +323,28 @@ def classify_trace(spectrogram, templates):
             if distance < best_distance:
                 best_distance = distance
                 best_label = label
-                
             best_distance_per_label[label] = min(distance, best_distance_per_label[label])
+
+                
+        # Check if filtering changes this.
+        for template in class_templates:
+            distance, _, _, _ = accelerated_dtw(
+                np.array((trace_result-np.mean(trace_result_nonfiltered)/np.std(trace_result_nonfiltered))).reshape(-1, 1),
+                np.array((template-np.mean(template)/np.std(template))).reshape(-1, 1),
+                dist='euclidean'
+            )
+            if distance < best_distance_nonfiltered:
+                best_distance_nonfiltered = distance
+                best_label_nonfiltered = label
+        
+        if best_label != best_label_nonfiltered:
+            filter_change_files.append(filename)
+            
+                
         # Experimental based on histogram.
         # Seems like when we mispredict as DEN, on avg the distance to ROP is >= 600, and if we predict DEN correctly it is < 600
-        if(best_distance > distance_threshold and best_distance_per_label["ROP"] > 600):
-            best_label = "NULL"
+        if(best_label == "DEN" and best_distance > distance_threshold):
+            #best_label = "NULL"
             #print(best_label, best_distance)
             pass
     
@@ -403,6 +432,40 @@ def show_histogram_of_distances(distances, title, bins=6):
 
     # Show the plot
     plt.show()
+    
+def keep_top_connected_components(array, top_n=5):
+    # Label the connected components
+    labeled_array, num_features = scipy_label(array)
+    
+    # Measure the size of each connected component
+    component_sizes = [(i, (labeled_array == i).sum()) for i in range(1, num_features + 1)]
+    
+    # Sort components by size in descending order
+    top_components = sorted(component_sizes, key=lambda x: x[1], reverse=True)[:top_n]
+    top_labels = {component[0] for component in top_components}
+    
+    # Create a new array with only the top components
+    filtered_array = np.where(np.isin(labeled_array, list(top_labels)), array, 0)
+    
+    return filtered_array
+
+def filter_large_components(array, size_threshold=10):
+    # Label the connected components
+    labeled_array, num_features = scipy_label(array)
+    
+    # Initialize an array to store the filtered result
+    filtered_array = np.zeros_like(array)
+    
+    # Iterate through each connected component
+    for i in range(1, num_features + 1):
+        # Get the mask for the current component
+        component_mask = (labeled_array == i)
+        # Check the size of the current component
+        if component_mask.sum() > size_threshold:
+            # Keep the component if it exceeds the size threshold
+            filtered_array[component_mask] = array[component_mask]
+    
+    return filtered_array
 
 if __name__ == "__main__":
     classes = ['DEN', 'ROP', 'SCA', 'GRA', 'SAR']
@@ -415,11 +478,11 @@ if __name__ == "__main__":
     print("Optimizing parameters\n")
     #optimized_parameters = optimize_class_parameters(classes, training_dir)
     optimized_parameters = {
-        'DEN': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'ROP': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'SCA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'GRA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'SAR': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}}
+        'DEN': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 600, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'ROP': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 600, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'SCA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 600, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'GRA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 600, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'SAR': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 600, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}}
     
     print("Optimized Parameters:", optimized_parameters)
     class_parameters.update(optimized_parameters)
@@ -457,13 +520,13 @@ if __name__ == "__main__":
             if spectrogram is None:
                 print(f"Skipping file {filename} due to invalid spectrogram.")
                 continue
-            predicted_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label = classify_trace(spectrogram, templates)
+            predicted_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label = classify_trace(spectrogram, templates, filename)
             y_true.append(cls)
             y_pred.append(predicted_label)
             
-            if cls != predicted_label:
+            if cls != predicted_label and filename in filter_change_files:
                 print(i, filename, f"predicted: {predicted_label}, actual: {cls}, distance: {best_distance}")
-                #display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
+                display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
                 
             if predicted_label == 'DEN':
                 if cls != predicted_label:
@@ -475,10 +538,12 @@ if __name__ == "__main__":
     
     for true_cls in classes:
         for cls_for_dist in classes:
-            show_histogram_of_distances(all_class_distance_mispredict_denise[true_cls][cls_for_dist], f"Distances to {cls_for_dist} when mispredicting DEN with true class {true_cls}", 20)
-
+            #show_histogram_of_distances(all_class_distance_mispredict_denise[true_cls][cls_for_dist], f"Distances to {cls_for_dist} when mispredicting DEN with true class {true_cls}", 20)
+            pass
+        
     for cls_for_dist in classes:
-        show_histogram_of_distances(all_class_distance_correct_predict_denise[cls_for_dist], f"Distances to {cls_for_dist} when we predicted DEN correctly", 20)
+        #show_histogram_of_distances(all_class_distance_correct_predict_denise[cls_for_dist], f"Distances to {cls_for_dist} when we predicted DEN correctly", 20)
+        pass
 
     print(y_pred)
     
