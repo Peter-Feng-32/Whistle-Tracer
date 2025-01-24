@@ -11,6 +11,8 @@ import librosa
 import matplotlib.pyplot as plt
 from skimage import feature
 from scipy.ndimage import binary_dilation, binary_erosion, binary_closing, binary_fill_holes, binary_opening
+from collections import defaultdict
+from statistics import median, mean
 
 SAMPLE_RATE = 192000
 FRAME_TIME_LENGTH = 2  # seconds
@@ -281,6 +283,9 @@ def optimize_class_parameters(classes, training_dir, num_templates_per_class=5):
 def classify_trace(spectrogram, templates):
     best_distance = float('inf')
     best_label = 'NULL'
+    
+    best_distance_per_label = defaultdict(lambda: float('inf'))
+    
     for label, class_templates in templates.items():
         params = class_parameters[label]
         power_threshold = params['power_threshold']
@@ -305,7 +310,18 @@ def classify_trace(spectrogram, templates):
             if distance < best_distance:
                 best_distance = distance
                 best_label = label
-    return best_label, best_distance, trace_result, modified_spectrogram, original_spectrogram
+                
+            best_distance_per_label[label] = min(distance, best_distance_per_label[label])
+        # Experimental based on histogram.
+        # Seems like when we mispredict as DEN, on avg the distance to ROP is >= 600, and if we predict DEN correctly it is < 600
+        if(best_distance > distance_threshold and best_distance_per_label["ROP"] > 600):
+            best_label = "NULL"
+            #print(best_label, best_distance)
+            pass
+    
+
+            
+    return best_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label
 
 def gaussian_kernel(size: int, sigma: float) -> np.ndarray:
     """
@@ -375,6 +391,18 @@ def display_spectrogram_with_array(original_spectrogram: np.ndarray, modified_sp
     
     plt.tight_layout()
     plt.show()
+    
+def show_histogram_of_distances(distances, title, bins=6):
+    # Create a histogram
+    plt.hist(distances, bins=bins, color='blue', edgecolor='black', alpha=0.7)
+
+    # Add labels and title
+    plt.xlabel('Distance')
+    plt.ylabel('Frequency')
+    plt.title(title)
+
+    # Show the plot
+    plt.show()
 
 if __name__ == "__main__":
     classes = ['DEN', 'ROP', 'SCA', 'GRA', 'SAR']
@@ -387,11 +415,11 @@ if __name__ == "__main__":
     print("Optimizing parameters\n")
     #optimized_parameters = optimize_class_parameters(classes, training_dir)
     optimized_parameters = {
-        'DEN': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'ROP': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'SCA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'GRA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
-        'SAR': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}}
+        'DEN': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'ROP': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'SCA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'GRA': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}, 
+        'SAR': {'power_threshold': 80, 'comparison_range': 2, 'distance_threshold': 400, 'window_size': 21, 'sigma': 1, 'low_threshold': 0.9, 'high_threshold': 0.95}}
     
     print("Optimized Parameters:", optimized_parameters)
     class_parameters.update(optimized_parameters)
@@ -405,6 +433,17 @@ if __name__ == "__main__":
     print("Running classification experiment\n")
     y_true = []
     y_pred = []
+    
+    """
+    Experiment: 
+    I want to know the average distance to every class when we mispredict denise and when we correctly predict denise.
+    If they are wildly different, we have a good way to detect when a denise prediction is a misprediction
+    """
+    
+    #[true class, class for distance]
+    all_class_distance_mispredict_denise = defaultdict(lambda: defaultdict(lambda: []))
+    all_class_distance_correct_predict_denise = defaultdict(lambda: [])
+    
     for cls in classes:
         label = class_mapping[cls]
         class_dir = os.path.join(testing_dir, label)
@@ -418,14 +457,29 @@ if __name__ == "__main__":
             if spectrogram is None:
                 print(f"Skipping file {filename} due to invalid spectrogram.")
                 continue
-            predicted_label, _, trace_result, modified_spectrogram, original_spectrogram = classify_trace(spectrogram, templates)
+            predicted_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label = classify_trace(spectrogram, templates)
             y_true.append(cls)
             y_pred.append(predicted_label)
             
             if cls != predicted_label:
-                print(i, filename)
-                display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
+                print(i, filename, f"predicted: {predicted_label}, actual: {cls}, distance: {best_distance}")
+                #display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
                 
+            if predicted_label == 'DEN':
+                if cls != predicted_label:
+                    for curr_cls in classes:
+                        all_class_distance_mispredict_denise[cls][curr_cls].append(best_distance_per_label[curr_cls])
+                else:
+                    for curr_cls in classes:
+                        all_class_distance_correct_predict_denise[curr_cls].append(best_distance_per_label[curr_cls])
+    
+    for true_cls in classes:
+        for cls_for_dist in classes:
+            show_histogram_of_distances(all_class_distance_mispredict_denise[true_cls][cls_for_dist], f"Distances to {cls_for_dist} when mispredicting DEN with true class {true_cls}", 20)
+
+    for cls_for_dist in classes:
+        show_histogram_of_distances(all_class_distance_correct_predict_denise[cls_for_dist], f"Distances to {cls_for_dist} when we predicted DEN correctly", 20)
+
     print(y_pred)
     
     print("Confusion Matrix:")
