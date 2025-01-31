@@ -14,6 +14,7 @@ from scipy.ndimage import binary_dilation, binary_erosion, binary_closing, binar
 from collections import defaultdict
 from statistics import median, mean
 from scipy.ndimage import label as scipy_label, find_objects
+from scipy.spatial.distance import euclidean
 
 SAMPLE_RATE = 192000
 FRAME_TIME_LENGTH = 2  # seconds
@@ -104,7 +105,76 @@ def get_spectrogram(filename):
         print(f"Error processing file {filename}: {e}")
         return None, None, None
 
-def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_delta=2, pcen_r=0.5, kernel_size=3, window_size = 3, sigma = 3, high_threshold=0.5, low_threshold=0.2, filter = False):
+def convolve_skip_zeros(arr, kernel_size=3):
+    kernel = np.ones(kernel_size)  # Uniform kernel
+    smoothed = np.copy(arr)  # Copy to preserve zero positions
+
+    # Count the number of nonzero elements in the window
+    nonzero_counts = np.convolve((arr != 0).astype(float), kernel, mode='same')
+
+    # Perform convolution, treating zero values as missing
+    convolved_values = np.convolve(arr, kernel, mode='same')
+
+    # Normalize by nonzero counts (avoid division by zero)
+    mask = nonzero_counts > 0
+    smoothed[mask] = convolved_values[mask] / nonzero_counts[mask]
+
+    return smoothed
+
+
+
+def get_entropy(window):
+    # Normalize the matrix to obtain probabilities
+    prob_mat = window / np.sum(window)
+
+    # Replace 0 by small value to avoid log 0
+    prob_mat = np.where(prob_mat > 0, prob_mat, 1e-10)
+
+    # Calculate entropy
+    entropy = -np.sum(prob_mat * np.log2(prob_mat))
+
+    # Normalize by the size of the matrix
+    entropy /= np.log2(np.size(window))
+
+    return entropy
+
+
+
+def denoise(original_matrix, output="", window_height=80, window_width=10, entropy_threshold=0.95,
+            magnitude_threshold=0.4):
+    matrix = original_matrix.copy()
+    for line in range(0, matrix.shape[0], window_height):
+        for column in range(0, matrix.shape[1], window_width):
+            # window retrieval
+            window = original_matrix[line:line + window_height, column:column + window_width]
+            # Normalization
+            if (np.max(window) == np.min(window)):
+                continue
+            #window = (window - np.min(window)) / (np.max(window) - np.min(window))
+            # Entropy calculation
+            entropy = get_entropy(window)
+            if entropy > entropy_threshold:
+                # Remove high entropy windows
+                window = 0
+            else:
+                # Apply Magnitude filtering to windows that are kept
+                window = np.where(window < magnitude_threshold, 0, window)
+            if output == 'entropy':
+                # show entropy value instead
+                window = entropy
+            # Replace old window values with new ones
+            matrix[line:line + window_height, column:column + window_width] = window
+    if output == 'original':
+        # Get original non normalized values
+        matrix = np.where(matrix != 0, original_matrix, 0)
+    if output == 'mask':
+        # Generate binary mask
+        matrix = np.where(matrix != 0, 1, 0)
+    return matrix
+
+
+
+def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_delta=2, pcen_r=0.5, kernel_size=3, window_size = 3, sigma = 3, high_threshold=0.5, low_threshold=0.2, filter = False, normalize_to_one=True):
     trace = [0]
     power_threshold = np.percentile(spectrogram.flatten(), 90)
     spectrogram[spectrogram < power_threshold] = 0
@@ -129,30 +199,39 @@ def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_d
         [.1, .1, .1, .1, .1],
     ])
     # Compute local density using convolution
-    local_density = convolve((modified_spectrogram > 0).astype(float), kernel, mode='constant', cval=0)
-
+    
+    modified_spectrogram = denoise(modified_spectrogram)
+    spectrogram = modified_spectrogram
     modified_spectrogram = feature.canny(modified_spectrogram, sigma=sigma, high_threshold=high_threshold, low_threshold=low_threshold)
     modified_spectrogram = binary_closing(input=modified_spectrogram, structure=structure)
+    
 
     if filter:
-        filtered_spectrogram = filter_large_components(modified_spectrogram, 5)
-        nonfiltered_spectrogram = modified_spectrogram
-        modified_spectrogram = filtered_spectrogram
-    else:
-        nonfiltered_spectrogram = spectrogram
-    
-    #modified_spectrogram = spectrogram * local_density
-    window_size=21
-    #trace = trace_orig(spectrogram=modified_spectrogram.astype(float), comparison_range=5)
-    #trace = np.argmax(spectrogram, axis=0)
-
+        modified_spectrogram = filter_large_components(modified_spectrogram, 5)
+            
     # One-liner to compute the average of y-positions (row indices) where values > 0 for each column
     trace = np.array([np.mean(np.where(modified_spectrogram[:, col] > 0)[0]) if np.any(modified_spectrogram[:, col] > 0) else 0 for col in range(modified_spectrogram.shape[1])])
+    #if filter: 
+    #trace[trace[:] != 0]
 
     #trace = medfilt(trace, window_size)
+    #zero_mask = trace[:] == 0
+    #trace = np.convolve(trace, np.ones(5)/5, mode='valid')
+    #trace = convolve_skip_zeros(trace, 5)
+    
+    # Where originally we have no signal, we don't want to artificially make a signal with the moving avg.
+    #trace = trace * zero_mask
+    
+     #Normalize for DTW.
+    
+    if normalize_to_one:
+        trace = np.array(2 * (trace-np.min(trace))/(np.max(trace) - np.min(trace)) - 1 )
+    else:
+        trace = np.array(((trace-np.mean(trace))/np.std(trace)))
+    #trace[zero_mask == 1] = 0 #Mark places where we want to skip because there is no data.
+    
+    return trace, modified_spectrogram, spectrogram
 
-    trace = np.convolve(trace, np.ones(5)/5, mode='valid')
-    return trace, modified_spectrogram, nonfiltered_spectrogram
 
 def apply_pcen(spectrogram, alpha=0.98, delta=2.0, r=0.5, eps=1e-6):
     pcen = librosa.pcen(spectrogram, sr=192000)
@@ -199,7 +278,7 @@ def create_class_templates(classes, training_dir, num_files_per_class=5, test_pa
                 print(f"Skipping file {filename} due to invalid spectrogram.")
                 continue
             #trace_result, modified_spectrogram = trace(spectrogram, power_threshold, comparison_range, pcen_alpha, pcen_delta, pcen_r)
-            trace_result, modified_spectrogram, original_spectrogram = trace(spectrogram, power_threshold, comparison_range, window_size=window_size, sigma=sigma, low_threshold=low_threshold, high_threshold=high_threshold)
+            trace_result, modified_spectrogram, original_spectrogram = trace(spectrogram, power_threshold, comparison_range, window_size=window_size, sigma=sigma, low_threshold=low_threshold, high_threshold=high_threshold, filter=True, normalize_to_one=True)
 
             if display:
                 display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, cls)
@@ -207,6 +286,11 @@ def create_class_templates(classes, training_dir, num_files_per_class=5, test_pa
             templates[cls].append(trace_result)
 
     return templates
+
+def masked_distance(x, y):
+    """Custom distance function that ignores zero values."""
+    return euclidean(x, y)  # Use absolute difference otherwise
+
 
 def optimize_class_parameters(classes, training_dir, num_templates_per_class=5):
     optimized_parameters = {}
@@ -261,7 +345,7 @@ def optimize_class_parameters(classes, training_dir, num_templates_per_class=5):
                     distance, _, _, _ = accelerated_dtw(
                         np.array(trace_result).reshape(-1, 1),
                         np.array(template).reshape(-1, 1),
-                        dist='euclidean'
+                        dist='euclidean',
                     )
                     if not total_distance:
                         total_distance = 0
@@ -314,22 +398,25 @@ def classify_trace(spectrogram, templates, filename=""):
 
         for template in class_templates:
             distance, _, _, _ = accelerated_dtw(
-                np.array((trace_result-np.mean(trace_result)/np.std(trace_result))).reshape(-1, 1),
-                np.array((template-np.mean(template)/np.std(template))).reshape(-1, 1),
-                dist='euclidean'
+                np.array(trace_result).reshape(-1, 1),
+                np.array(template).reshape(-1, 1),
+                dist='euclidean',
+                warp=1
             )
+                
             if distance < best_distance:
                 best_distance = distance
                 best_label = label
             best_distance_per_label[label] = min(distance, best_distance_per_label[label])
 
                 
-        # Check if filtering changes this.
+        # Check if not filtering changes this.
         for template in class_templates:
             distance, _, _, _ = accelerated_dtw(
-                np.array((trace_result-np.mean(trace_result_nonfiltered)/np.std(trace_result_nonfiltered))).reshape(-1, 1),
-                np.array((template-np.mean(template)/np.std(template))).reshape(-1, 1),
-                dist='euclidean'
+                np.array(trace_result_nonfiltered).reshape(-1, 1),
+                np.array(template).reshape(-1, 1),
+                dist='euclidean',
+                warp=1
             )
             if distance < best_distance_nonfiltered:
                 best_distance_nonfiltered = distance
@@ -342,8 +429,6 @@ def classify_trace(spectrogram, templates, filename=""):
             #print(best_label, best_distance)
             pass
     
-
-            
     return best_label, best_distance, trace_result, modified_spectrogram, original_spectrogram, best_distance_per_label, best_label_nonfiltered, trace_result_nonfiltered
 
 def gaussian_kernel(size: int, sigma: float) -> np.ndarray:
@@ -417,7 +502,7 @@ def display_spectrogram_with_array(original_spectrogram: np.ndarray, modified_sp
     
 def display_spectrogram_with_array_filtered(original_spectrogram: np.ndarray, modified_spectrogram: np.ndarray, array: np.ndarray, array_filtered: np.ndarray,
                                    spectrogram_title: str = "Spectrogram", 
-                                   array_title: str = "1D Array", array_title_filtered: str = "1D Array Filtered"):
+                                   array_title: str = "1D Array", array_title_filtered: str = "1D Array Filtered", save: bool = False, title: str = "test"):
     """
     Displays a 2D numpy array (spectrogram) side by side with a 1D numpy array.
 
@@ -462,7 +547,12 @@ def display_spectrogram_with_array_filtered(original_spectrogram: np.ndarray, mo
     ax3.grid(True)
     
     plt.tight_layout()
-    plt.show()
+    if save:
+        plt.savefig(f"./pictures7/{title}.png", dpi=300, bbox_inches='tight')  # Save as PNG with high resolution
+        plt.close()
+    else:
+        plt.show()
+
     
 def show_histogram_of_distances(distances, title, bins=6):
     # Create a histogram
@@ -567,11 +657,11 @@ if __name__ == "__main__":
             y_true.append(cls)
             y_pred.append(predicted_label)
             
-            if cls != predicted_label and predicted_label != predicted_label_nonfiltered:
+            if cls != predicted_label:
                 #print(i, filename, f"predicted: {predicted_label}, actual: {cls}, distance: {best_distance}")
-                print(i, filename, f"predicted: {predicted_label}, nonfiltered_predicted: {predicted_label_nonfiltered}, actual: {cls}, distance: {best_distance}")
+                print(i, filename, f"predicted: {predicted_label}, nonfiltered_predicted: {predicted_label_nonfiltered}, actual: {cls}, distance: {best_distance}, distance to actual: {best_distance_per_label[cls]}")
                 #display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
-                display_spectrogram_with_array_filtered(original_spectrogram, modified_spectrogram, trace_result_nonfiltered, trace_result, cls, predicted_label_nonfiltered, predicted_label)
+                display_spectrogram_with_array_filtered(original_spectrogram, modified_spectrogram, trace_result_nonfiltered, trace_result, cls, predicted_label_nonfiltered, predicted_label, save=True, title=filename)
                 
             if predicted_label == 'DEN':
                 if cls != predicted_label:
