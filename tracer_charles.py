@@ -15,7 +15,16 @@ from collections import defaultdict
 from statistics import median, mean
 from scipy.ndimage import label as scipy_label, find_objects
 from scipy.spatial.distance import euclidean
+from skimage.filters import try_all_threshold, threshold_yen, hessian, meijering
+from skimage.restoration import denoise_bilateral
+from skimage.morphology import skeletonize
+import copy
+import scipy as sp
+from scipy.spatial import KDTree
+from scipy.interpolate import interp1d
+from scipy.signal import wiener
 
+denoised_image = wiener(image)
 SAMPLE_RATE = 192000
 FRAME_TIME_LENGTH = 2  # seconds
 WINDOW_SIZE = 2048
@@ -42,6 +51,37 @@ class_parameters = {
     'GRA': {'power_threshold': 85, 'comparison_range': 4, 'distance_threshold': 130, 'window_size': 5, 'sigma': 3, 'low_threshold': 0.4, 'high_threshold': 0.7},
     'SAR': {'power_threshold': 75, 'comparison_range': 3, 'distance_threshold': 115, 'window_size': 5, 'sigma': 3, 'low_threshold': 0.4, 'high_threshold': 0.7},
 }
+
+from scipy.ndimage import uniform_filter
+
+def guided_filter(I, p, r, eps):
+    """
+    Fast Guided Filter Implementation.
+
+    Parameters:
+    - I: Guidance image (grayscale, float32)
+    - p: Input image to be filtered
+    - r: Radius of local window
+    - eps: Regularization parameter
+
+    Returns:
+    - Filtered image
+    """
+    mean_I = uniform_filter(I, size=2*r+1, mode='reflect')
+    mean_p = uniform_filter(p, size=2*r+1, mode='reflect')
+    mean_Ip = uniform_filter(I * p, size=2*r+1, mode='reflect')
+    
+    cov_Ip = mean_Ip - mean_I * mean_p
+    var_I = uniform_filter(I * I, size=2*r+1, mode='reflect') - mean_I * mean_I
+    
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+    
+    mean_a = uniform_filter(a, size=2*r+1, mode='reflect')
+    mean_b = uniform_filter(b, size=2*r+1, mode='reflect')
+    
+    return mean_a * I + mean_b
+
 
 def generate_parameter_combinations():
     power_thresholds = [80, 90, 95]
@@ -99,7 +139,7 @@ def get_spectrogram(filename):
         frequencies, times, spectrogram = signal.spectrogram(
             samples, sample_rate, window=WIN)
         spectrogram = 10 * np.log10(spectrogram + 1e-10)  # Avoid log(0)
-        spectrogram = (spectrogram - np.mean(spectrogram, axis=0)) / np.std(spectrogram, axis=0)
+        #spectrogram = (spectrogram - np.mean(spectrogram, axis=0)) / np.std(spectrogram, axis=0)
         return frequencies, times, spectrogram
     except Exception as e:
         print(f"Error processing file {filename}: {e}")
@@ -172,16 +212,41 @@ def denoise(original_matrix, output="", window_height=80, window_width=10, entro
         matrix = np.where(matrix != 0, 1, 0)
     return matrix
 
+def mask_missing_values(series):
+    # Create a mask where 1 represents valid values and 0 represents missing values
+    mask = np.isnan(series)
+    return mask
 
-
-def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_delta=2, pcen_r=0.5, kernel_size=3, window_size = 3, sigma = 3, high_threshold=0.5, low_threshold=0.2, filter = False, normalize_to_one=True):
+def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_delta=2, pcen_r=0.5, kernel_size=3, window_size = 3, sigma = 3, high_threshold=0.5, low_threshold=0.2, filter = False, normalize_to_one=False):
     trace = [0]
-    power_threshold = np.percentile(spectrogram.flatten(), 90)
-    spectrogram[spectrogram < power_threshold] = 0
-    #spectrogram = apply_pcen(spectrogram[150:300, :], pcen_alpha, pcen_delta, pcen_r,)
-
+    
     spectrogram = spectrogram[150:300, :]
-    modified_spectrogram = spectrogram
+    m, n = spectrogram.shape
+    spectrogram = wiener(spectrogram)
+
+    # Extreme values are capped to mean ± 1.5 std
+    fact_ = 1.5
+    mval = np.mean(spectrogram)
+    sval = np.std(spectrogram)
+    #=spectrogram[spectrogram > mval + fact_*sval] = mval + fact_*sval
+    #spectrogram[spectrogram < mval - fact_*sval] = mval - fact_*sval
+    inner=3
+    outer=128
+    wInner = np.ones(inner)
+    wOuter = np.ones(outer)
+
+    
+    #R = spectrogram.copy()
+    #for i in range(n):
+        #spectrogram[:,i] = spectrogram[:,i] - (np.convolve(R[:,i],wOuter,'same') - np.convolve(R[:,i],wInner,'same'))/(outer - inner)
+
+
+    modified_spectrogram = copy.deepcopy(spectrogram)
+    yen_threshold = threshold_yen(modified_spectrogram)
+    #print(yen_threshold)
+
+    spec_min = np.min(modified_spectrogram)
+    modified_spectrogram[modified_spectrogram < yen_threshold] = spec_min
 
     modified_spectrogram = (modified_spectrogram - np.min(modified_spectrogram)) / (np.max(modified_spectrogram) - np.min(modified_spectrogram)) # Normalization   
 
@@ -189,28 +254,23 @@ def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_d
         
     #Try closing - dilation then erosion
     structure = np.ones((3, 3))
-    
-    # Create a uniform kernel to calculate local density
-    kernel = np.array([
-        [.1, .1, .1, .1, .1],
-        [.1, .1, .1, .1, .1],
-        [.1, .1, 1, .1, .1],
-        [.1, .1, .1, .1, .1],
-        [.1, .1, .1, .1, .1],
-    ])
-    # Compute local density using convolution
-    
-    modified_spectrogram = denoise(modified_spectrogram)
-    spectrogram = modified_spectrogram
+
+    # Compute local density using convolution    
+    #modified_spectrogram = denoise(modified_spectrogram)
     modified_spectrogram = feature.canny(modified_spectrogram, sigma=sigma, high_threshold=high_threshold, low_threshold=low_threshold)
+    # Invert the binary image (skeletonize works better on white foreground)
     modified_spectrogram = binary_closing(input=modified_spectrogram, structure=structure)
-    
+
 
     if filter:
         modified_spectrogram = filter_large_components(modified_spectrogram, 5)
-            
+                    
     # One-liner to compute the average of y-positions (row indices) where values > 0 for each column
+    zeroes = np.where((np.array(modified_spectrogram) != 0).any(axis=0)== 0, 1, 0)
+    #print(zeroes)
     trace = np.array([np.mean(np.where(modified_spectrogram[:, col] > 0)[0]) if np.any(modified_spectrogram[:, col] > 0) else 0 for col in range(modified_spectrogram.shape[1])])
+    median_nonzero = np.median(trace[trace != 0])
+    trace[trace==0] = median_nonzero
     #if filter: 
     #trace[trace[:] != 0]
 
@@ -223,11 +283,11 @@ def trace(spectrogram, power_threshold, comparison_range, pcen_alpha=0.9, pcen_d
     #trace = trace * zero_mask
     
      #Normalize for DTW.
-    
-    if normalize_to_one:
-        trace = np.array(2 * (trace-np.min(trace))/(np.max(trace) - np.min(trace)) - 1 )
-    else:
-        trace = np.array(((trace-np.mean(trace))/np.std(trace)))
+    trace = np.array(2 * (trace-np.min(trace))/(np.max(trace) - np.min(trace)) - 1 )
+    for i in range(0, len(zeroes)):
+        if zeroes[i]:
+            trace[i] = -1
+
     #trace[zero_mask == 1] = 0 #Mark places where we want to skip because there is no data.
     
     return trace, modified_spectrogram, spectrogram
@@ -624,7 +684,7 @@ if __name__ == "__main__":
     #class_parameters = {'DEN': {'power_threshold': 90, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 11}, 'ROP': {'power_threshold': 90, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 21}, 'SCA': {'power_threshold': 90, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 11}, 'GRA': {'power_threshold': 90, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 31}, 'SAR': {'power_threshold': 90, 'comparison_range': 2, 'distance_threshold': 100, 'window_size': 21}}
     
     print("Loading templates\n")
-    templates = create_class_templates(classes, templates_dir, num_files_per_class=5, display=False)
+    templates = create_class_templates(classes, templates_dir, num_files_per_class=5, display=True)
 
     print("Running classification experiment\n")
     y_true = []
@@ -659,6 +719,8 @@ if __name__ == "__main__":
             
             if cls != predicted_label:
                 #print(i, filename, f"predicted: {predicted_label}, actual: {cls}, distance: {best_distance}")
+                #try_all_threshold(spectrogram)
+                #plt.show()
                 print(i, filename, f"predicted: {predicted_label}, nonfiltered_predicted: {predicted_label_nonfiltered}, actual: {cls}, distance: {best_distance}, distance to actual: {best_distance_per_label[cls]}")
                 #display_spectrogram_with_array(original_spectrogram, modified_spectrogram, trace_result, cls, predicted_label)
                 display_spectrogram_with_array_filtered(original_spectrogram, modified_spectrogram, trace_result_nonfiltered, trace_result, cls, predicted_label_nonfiltered, predicted_label, save=True, title=filename)
