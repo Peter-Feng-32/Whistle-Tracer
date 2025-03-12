@@ -31,7 +31,7 @@ import cv2
 
 SAMPLE_RATE = 192000
 FRAME_TIME_LENGTH = 2  # seconds
-WINDOW_SIZE = 2048
+WINDOW_SIZE = 4096
 WINDOW_TYPE = "hann"
 # Each freq bin represents approx 92 Hz
 LOWEST_FREQ = 5000  # 5000
@@ -66,10 +66,11 @@ def get_spectrogram(filename):
             print(f"File {filename} is too short. Skipping.")
             return None, None, None
         frequencies, times, spectrogram = signal.spectrogram(
-            samples, sample_rate, window=WIN)
+            samples, sample_rate, window=WIN, nperseg=4096, noverlap=4096-960)
         spectrogram = 10 * np.log10(spectrogram + 1e-10)  # Avoid log(0)
         #spectrogram = (spectrogram - np.mean(spectrogram, axis=0)) / np.std(spectrogram, axis=0)
         return frequencies, times, spectrogram
+        
     except Exception as e:
         print(f"Error processing file {filename}: {e}")
         return None, None, None
@@ -107,11 +108,17 @@ def keep_top_connected_components(array, top_n=5):
     filtered_array = np.where(np.isin(labeled_array, list(top_labels)), array, 0)
     
     return filtered_array
-
+    
+def normalize_spectrogram(spectrogram, new_min=-60, new_max=20):
+    """Normalizes a spectrogram to be within the range [-60, 20]."""
+    old_min, old_max = spectrogram.min(), spectrogram.max()
+    normalized_spectrogram = (spectrogram - old_min) * ((new_max - new_min) / (old_max - old_min)) + new_min
+    return normalized_spectrogram
+    
 def clean_template(spectrogram):
     rows, cols = spectrogram.shape
     print(rows, cols) #(1025, 111)
-    spectrogram = spectrogram[150:251, 0:110]
+    spectrogram = spectrogram[300:450, ]
     fact_ = 1.5
     mval = np.mean(spectrogram)
     sval = np.std(spectrogram)
@@ -120,6 +127,7 @@ def clean_template(spectrogram):
     spectrogram[spectrogram < power_threshold] = 0
     
     spectrogram = filter_large_components(spectrogram, 5)
+    spectrogram = normalize_spectrogram(spectrogram)
     return spectrogram
 
 def create_gaussian_pyramid(spectrogram):
@@ -138,6 +146,8 @@ def classify(spectrogram, templates, diff_threshold = 0.2):
     
     num_layers = 3
     spec_pyramid = create_gaussian_pyramid(spectrogram)
+    max_loc = None
+    max_val = None
     
     for i in range(num_layers - 1, -1, -1):
         maxscores = defaultdict(lambda: 0)
@@ -145,10 +155,12 @@ def classify(spectrogram, templates, diff_threshold = 0.2):
             
             # Apply template matching using normalized cross-correlation
             for pyramid in pyramids:                
-                result = cv2.matchTemplate(spec_pyramid[i], pyramid[i], cv2.TM_CCOEFF_NORMED)
-
+                #print(spec_pyramid[i].shape, pyramid[i].shape)
+                result = cv2.matchTemplate(np.float32(spec_pyramid[i]), pyramid[i], cv2.TM_CCOEFF_NORMED)
                 # Find the best match location and score
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                #print(cls, max_val, max_loc)
+
                 maxscores[cls] = max(maxscores[cls], max_val)
         scores = list(maxscores.items())
         scores = [(item[1], item[0]) for item in scores]
@@ -157,6 +169,7 @@ def classify(spectrogram, templates, diff_threshold = 0.2):
             levels[i] += 1
             return scores[-1][1]
     levels[55] += 1
+    #print(scores)
     return scores[-1][1]
             
 def create_class_templates(classes, training_dir, num_files_per_class=5, test_params=None, display=False):
@@ -185,6 +198,18 @@ def create_class_templates(classes, training_dir, num_files_per_class=5, test_pa
             templates[cls].append(gaussian_pyramid)
 
     return templates
+
+def output_templates(templates):
+    print(templates)
+    for cls, template_list in templates.items():
+        for index, template_pyramid in enumerate(template_list):
+            for img_index, image in enumerate(template_pyramid):
+                np.savetxt(f"saved_templates/{class_mapping[cls]}/{index}/{img_index}.txt", np.transpose(image))
+                print(cls, image.shape)
+                
+def output_spectrogram(name, label, spectrogram):
+    np.savetxt(f"spectrograms/{label}/{name}.txt", spectrogram)
+    
 
 def display_spectrogram_with_array(original_spectrogram: np.ndarray, modified_spectrogram: np.ndarray, array: np.ndarray, 
                                    spectrogram_title: str = "Spectrogram", 
@@ -227,6 +252,23 @@ def display_spectrogram_with_array(original_spectrogram: np.ndarray, modified_sp
     plt.tight_layout()
     plt.show()
 
+def display_spectrogram(data):
+    """Displays the spectrogram as an image."""
+    plt.figure(figsize=(10, 5))
+    plt.imshow(data, aspect="auto", origin="lower", cmap="inferno")  # Adjust colormap if needed
+    plt.colorbar(label="Intensity")
+    plt.xlabel("Time")
+    plt.ylabel("Frequency")
+    plt.title("Spectrogram")
+    plt.show()
+
+def load_spectrogram(filename, delimiter=" "):
+    """Reads a spectrogram from a text file, removes trailing commas, and converts it into a NumPy array."""
+    with open(filename, "r") as file:
+        cleaned_lines = [line.replace(",", "").strip() for line in file]  # Remove commas
+    data = np.loadtxt(cleaned_lines, delimiter=delimiter)
+    return data
+
 if __name__ == "__main__":
     classes = ['DEN', 'ROP', 'SCA', 'GRA', 'SAR']
     training_dir = "./2024DolphinDataset/training"
@@ -238,7 +280,16 @@ if __name__ == "__main__":
 
     print("Loading templates\n")
     templates = create_class_templates(classes, templates_dir, num_files_per_class=5, display=False)
-    
+   # spectrogram = load_spectrogram("spectrogram_.txt")
+    #spectrogram = spectrogram[0:250, :200]
+    #spectrogram = normalize_spectrogram(spectrogram)
+   # spectrogram = (spectrogram * -1).T
+   # predicted_label = classify(spectrogram, templates)
+
+   # display_spectrogram(spectrogram)
+    #display_spectrogram(templates["GRA"][0][0].T)
+
+    output_templates(templates)    
 
     print("Running classification experiment\n")
     y_true = []
@@ -254,6 +305,7 @@ if __name__ == "__main__":
         for i, filename in enumerate(class_files):
             filepath = os.path.join(class_dir, filename)
             _, _, spectrogram = get_spectrogram(filepath)
+            output_spectrogram(filename[:-4] + ".txt", label, spectrogram)
             if spectrogram is None:
                 print(f"Skipping file {filename} due to invalid spectrogram.")
                 continue
