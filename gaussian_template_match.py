@@ -54,6 +54,8 @@ class_parameters = {
     'SCA': {'power_threshold': 70, 'comparison_range': 2, 'distance_threshold': 110, 'window_size': 5, 'sigma': 3, 'low_threshold': 0.4, 'high_threshold': 0.7},
     'GRA': {'power_threshold': 85, 'comparison_range': 4, 'distance_threshold': 130, 'window_size': 5, 'sigma': 3, 'low_threshold': 0.4, 'high_threshold': 0.7},
     'SAR': {'power_threshold': 75, 'comparison_range': 3, 'distance_threshold': 115, 'window_size': 5, 'sigma': 3, 'low_threshold': 0.4, 'high_threshold': 0.7},
+    'NULL': {'power_threshold': 75, 'comparison_range': 3, 'distance_threshold': 115, 'window_size': 5, 'sigma': 3, 'low_threshold': 0.4, 'high_threshold': 0.7},
+
 }
 
 
@@ -117,7 +119,7 @@ def normalize_spectrogram(spectrogram, new_min=-60, new_max=20):
     
 def clean_template(spectrogram):
     rows, cols = spectrogram.shape
-    print(rows, cols) #(1025, 111)
+    #print(rows, cols) #(1025, 111)
     spectrogram = spectrogram[300:450, ]
     fact_ = 1.5
     mval = np.mean(spectrogram)
@@ -140,8 +142,9 @@ def create_gaussian_pyramid(spectrogram):
 
     
 levels = defaultdict(lambda: 0)
+classified_scores = []
     
-def classify(spectrogram, templates, diff_threshold = 0.2):
+def classify(spectrogram, templates, filename, diff_threshold = 0.2):
     best_label = "NULL"
     
     num_layers = 3
@@ -156,7 +159,7 @@ def classify(spectrogram, templates, diff_threshold = 0.2):
             # Apply template matching using normalized cross-correlation
             for pyramid in pyramids:                
                 #print(spec_pyramid[i].shape, pyramid[i].shape)
-                result = cv2.matchTemplate(np.float32(spec_pyramid[i]), pyramid[i], cv2.TM_CCOEFF_NORMED)
+                result = cv2.matchTemplate(np.float32(spec_pyramid[i]), np.float32(pyramid[i]), cv2.TM_CCOEFF_NORMED)
                 # Find the best match location and score
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
                 #print(cls, max_val, max_loc)
@@ -166,13 +169,16 @@ def classify(spectrogram, templates, diff_threshold = 0.2):
         scores = [(item[1], item[0]) for item in scores]
         scores.sort()
         if scores[-1][0] - scores[-2][0] >= diff_threshold:
+            print(scores)
             levels[i] += 1
+            classified_scores.append((scores[-1][0], filename))
             return scores[-1][1]
     levels[55] += 1
-    #print(scores)
-    return scores[-1][1]
+    print("level 0", scores)
+    classified_scores.append((scores[-1][0], filename))
+    return "NULL"
             
-def create_class_templates(classes, training_dir, num_files_per_class=5, test_params=None, display=False):
+def create_class_templates(classes, training_dir, num_files_per_class=1, test_params=None, display=False):
     templates = {cls: [] for cls in classes}
 
     for cls in classes:
@@ -200,7 +206,7 @@ def create_class_templates(classes, training_dir, num_files_per_class=5, test_pa
     return templates
 
 def output_templates(templates):
-    print(templates)
+    #print(templates)
     for cls, template_list in templates.items():
         for index, template_pyramid in enumerate(template_list):
             for img_index, image in enumerate(template_pyramid):
@@ -270,7 +276,7 @@ def load_spectrogram(filename, delimiter=" "):
     return data
 
 if __name__ == "__main__":
-    classes = ['DEN', 'ROP', 'SCA', 'GRA', 'SAR']
+    classes = ['DEN', 'ROP', 'SCA', 'GRA', 'SAR', "NULL"]
     training_dir = "./2024DolphinDataset/training"
     testing_dir = "./2024DolphinDataset/testing"
     templates_dir = "./2024DolphinDataset/templates"
@@ -279,18 +285,18 @@ if __name__ == "__main__":
     
 
     print("Loading templates\n")
-    templates = create_class_templates(classes, templates_dir, num_files_per_class=5, display=False)
-   # spectrogram = load_spectrogram("spectrogram_.txt")
+    templates = create_class_templates(classes, templates_dir, num_files_per_class=1, display=False)
+    spectrogram = load_spectrogram("spectrogram_.txt")
     #spectrogram = spectrogram[0:250, :200]
     #spectrogram = normalize_spectrogram(spectrogram)
-   # spectrogram = (spectrogram * -1).T
-   # predicted_label = classify(spectrogram, templates)
+    spectrogram = (spectrogram).T
 
-   # display_spectrogram(spectrogram)
+   #display_spectrogram(spectrogram)
     #display_spectrogram(templates["GRA"][0][0].T)
 
     output_templates(templates)    
 
+    
     print("Running classification experiment\n")
     y_true = []
     y_pred = []
@@ -311,7 +317,7 @@ if __name__ == "__main__":
                 continue
             
             filename_no_ext = filename[:-4]
-            predicted_label = classify(spectrogram, templates)
+            predicted_label = classify(spectrogram, templates, diff_threshold=0.1, filename=filename)
             y_true.append(cls)
             y_pred.append(predicted_label)
             best_distance = 0
@@ -322,6 +328,8 @@ if __name__ == "__main__":
                 
     print(y_pred)
     print(levels)
+    
+    print(min(classified_scores), max(classified_scores), sorted(classified_scores))
     
     print("Confusion Matrix:")
     print(confusion_matrix(y_true, y_pred, labels=classes))
