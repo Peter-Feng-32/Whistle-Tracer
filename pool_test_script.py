@@ -59,8 +59,8 @@ class_parameters = {
 }
 
 def normalize_spectrogram(spectrogram):
-    desired_mean=-6.62,
-    desired_stdev=5.36
+    desired_mean=0,
+    desired_stdev=1
     curr_stdev = np.std(spectrogram, axis=0)
     curr_mean = np.mean(spectrogram, axis=0)
     curr_stdev[curr_stdev == 0] = 1e-8
